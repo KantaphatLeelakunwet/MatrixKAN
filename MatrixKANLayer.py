@@ -5,6 +5,10 @@ import kan
 from kan.spline import *
 from kan.utils import sparse_mask
 
+MAX_INPUT = 1000
+MAX_IN_NODE = 5
+MAX_OUT_NODE = 5
+GRID_SIZE = 10
 
 class MatrixKANLayer(kan.KANLayer, nn.Module):
     """
@@ -42,7 +46,7 @@ class MatrixKANLayer(kan.KANLayer, nn.Module):
             device
     """
 
-    def __init__(self, in_dim=3, out_dim=2, num=5, k=3, noise_scale=0.5, scale_base_mu=0.0, scale_base_sigma=1.0, scale_sp=1.0, base_fun=torch.nn.SiLU(), grid_eps=0.02, grid_range=[-1, 1], sp_trainable=True, sb_trainable=True, save_plot_data = True, device='cpu', sparse_init=False):
+    def __init__(self, in_dim=3, out_dim=2, num=5, k=3, noise_scale=0.5, scale_base_mu=0.0, scale_base_sigma=1.0, scale_sp=1.0, base_fun=torch.nn.SiLU(), grid_eps=0.02, grid_range=[-1, 1], sp_trainable=True, sb_trainable=True, save_plot_data = True, device='cpu', sparse_init=False, socket=None):
         """
         initialize a MatrixKANLayer
         
@@ -122,6 +126,34 @@ class MatrixKANLayer(kan.KANLayer, nn.Module):
         self.grid_eps = grid_eps
         
         self.to(device)
+        
+        # ================================================
+        #               Initialize Matrix
+        # ================================================
+        
+        # Socket to FPGA via ZeroMQ
+        self.socket = socket
+        
+        # Pre-allocate all buffers avoid recreation
+        self._grid_buffer = np.zeros((MAX_IN_NODE, GRID_SIZE), dtype=np.float32)
+        self._grid_buffer = np.ascontiguousarray(self._grid_buffer)
+        self._coef_buffer = np.zeros((MAX_IN_NODE, MAX_OUT_NODE, 6), dtype=np.float32)
+        self._coef_buffer = np.ascontiguousarray(self._coef_buffer)
+        self._X_buffer = np.zeros((MAX_INPUT, MAX_IN_NODE), dtype=np.float32)
+        self._X_buffer = np.ascontiguousarray(self._X_buffer)
+        
+        # Pre-compute sizes
+        self._grid_size = MAX_IN_NODE * GRID_SIZE
+        self._coef_size = MAX_IN_NODE * MAX_OUT_NODE * 6
+        self._X_size = MAX_INPUT * MAX_IN_NODE
+        
+        # Allocated input buffer to FPGA as 1D array to send as a stream
+        self._input_buffer = np.zeros(self._grid_size + self._coef_size + self._X_size, dtype=np.float32)
+        
+        # Create memory views for each segment
+        self._grid_view = self._input_buffer[:self._grid_size]
+        self._coef_view = self._input_buffer[self._grid_size : self._grid_size + self._coef_size]
+        self._X_view = self._input_buffer[self._grid_size + self._coef_size:]
 
     def __getattribute__(self, name):
         """Dynamically replaces KANLayer calls with calls to MatrixKANLayer."""
@@ -273,7 +305,7 @@ class MatrixKANLayer(kan.KANLayer, nn.Module):
 
         return result
 
-    def forward(self, x):
+    def forward(self, x, fpga=False):
         """
         MatrixKANLayer forward given input x
         
@@ -298,7 +330,55 @@ class MatrixKANLayer(kan.KANLayer, nn.Module):
         preacts = x[:,None,:].clone().expand(batch, self.out_dim, self.in_dim)
             
         base = self.base_fun(x) # (batch, in_dim)
-        y = self.b_splines_matrix_output(x)
+        
+        # ==============================================
+        #                OFFLOAD TO FPGA
+        # ==============================================
+        
+        if fpga:
+            self._grid_buffer[:self.grid.shape[0], :self.grid.shape[1]] = self.grid.cpu().numpy().astype(np.float32)
+            self._coef_buffer[:self.coef.shape[0], :self.coef.shape[1], :self.coef.shape[2]] = self.coef.cpu().numpy().astype(np.float32)
+            self._grid_view[:] = np.ravel(self._grid_buffer)
+            self._coef_view[:] = np.ravel(self._coef_buffer)
+            
+            valid_result = np.zeros((x.shape[0], self.coef.shape[0], self.coef.shape[1]), dtype=np.float64)
+            
+            batch_num = x.shape[0] // MAX_INPUT
+            remainder = x.shape[0] % MAX_INPUT
+            
+            for offset in range(batch_num):
+                batch_slice = slice(offset * MAX_INPUT, (offset + 1) * MAX_INPUT)
+                self._X_buffer.fill(0)  # Reset buffer
+                self._X_buffer[:, :x.shape[1]] = x[batch_slice, :].cpu().numpy().astype(np.float32)
+                self._X_view[:] = np.ravel(self._X_buffer)
+                
+                # Send to FPGA
+                mv = memoryview(self._input_buffer)
+                self.socket.send(mv)
+                
+                # Receive from FPGA
+                fpga_output = self.socket.recv()
+                result = np.frombuffer(fpga_output, dtype=np.float32).reshape((MAX_INPUT, MAX_IN_NODE, MAX_OUT_NODE))
+                valid_result[batch_slice] = result[:, :self.coef.shape[0], :self.coef.shape[1]].astype(np.float64)
+            
+            if remainder:
+                offset = batch_num
+                batch_slice = slice(offset * MAX_INPUT, None)
+                self._X_buffer.fill(0)  # Reset buffer
+                self._X_buffer[:, :x.shape[1]] = x[batch_slice, :].cpu().numpy().astype(np.float32)
+                self._X_view[:] = np.ravel(self._X_buffer)
+                
+                mv = memoryview(self._input_buffer)
+                self.socket.send(mv)
+                # self.socket.send(self._input_buffer.tobytes())
+                
+                fpga_output = self.socket.recv()
+                result = np.frombuffer(fpga_output, dtype=np.float32).reshape((MAX_INPUT, MAX_IN_NODE, MAX_OUT_NODE))
+                valid_result[batch_slice] = result[:remainder, :self.coef.shape[0], :self.coef.shape[1]].astype(np.float64)
+                
+            y = torch.tensor(valid_result).to(self.device)
+        else:
+            y = self.b_splines_matrix_output(x)
         
         postspline = y.clone().permute(0,2,1)
             
