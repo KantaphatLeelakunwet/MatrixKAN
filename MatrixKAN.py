@@ -6,6 +6,7 @@ import kan
 from kan.Symbolic_KANLayer import Symbolic_KANLayer
 import os
 import random
+import zmq
 
 
 class MatrixKAN(kan.MultKAN, nn.Module):
@@ -137,6 +138,14 @@ class MatrixKAN(kan.MultKAN, nn.Module):
         --------
             self
         """
+        
+        # ================================================
+        #            Setup ZeroMQ Connection
+        # ================================================
+        # Setup port to transfer data between host computer to the board
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.connect("tcp://192.168.2.99:5555")
 
         nn.Module.__init__(self)
 
@@ -184,7 +193,7 @@ class MatrixKAN(kan.MultKAN, nn.Module):
                                       noise_scale=noise_scale, scale_base_mu=scale_base_mu,
                                       scale_base_sigma=scale_base_sigma, scale_sp=1., base_fun=base_fun,
                                       grid_eps=grid_eps, grid_range=grid_range, sp_trainable=sp_trainable,
-                                      sb_trainable=sb_trainable, sparse_init=sparse_init)
+                                      sb_trainable=sb_trainable, sparse_init=sparse_init, socket=socket)
             self.act_fun.append(sp_batch)
 
         self.node_bias = []
