@@ -3,3 +3,5 @@ venv/
 model/
 figures/
 __pycache__/
+.vscode/
+log/
